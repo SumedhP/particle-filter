@@ -102,6 +102,24 @@ class systematic_resampler {
 
   target_config::vector<weight_type> particle_weights_;
   target_config::vector<truncated_representation_type> particle_scatter_indices_;
+  bool buffers_ready_;
+
+  void ensure_buffers_ready_() noexcept {
+    if (buffers_ready_) {
+      return;
+    }
+
+    temp_particles_.resize(number_of_particles_);
+    temp_particle_indices_.resize(number_of_particles_);
+    particle_weights_.resize(number_of_particles_);
+    particle_scatter_indices_.resize(number_of_particles_ + std::size_t{1});
+
+    const auto last_scatter_index =
+        truncated_representation_type::from_integral(static_cast<index_type>(number_of_particles_));
+    particle_scatter_indices_[number_of_particles_] = last_scatter_index;
+
+    buffers_ready_ = true;
+  }
 
  public:
   template <typename ExecutionPolicy>
@@ -109,6 +127,8 @@ class systematic_resampler {
       const ExecutionPolicy& execution_policy,
       const target_config::vector<weight_type>& log_weights,
       target_config::vector<T>& particles) noexcept {
+    ensure_buffers_ready_();
+
     const weight_type maximum_log_weight = thrust::reduce(
         execution_policy,
         log_weights.cbegin(),
@@ -170,13 +190,11 @@ class systematic_resampler {
 
   systematic_resampler(const std::size_t& number_of_particles) noexcept
       : number_of_particles_{number_of_particles},
-        temp_particles_(number_of_particles),
-        temp_particle_indices_(number_of_particles),
-        particle_weights_(number_of_particles),
-        particle_scatter_indices_(number_of_particles) {
-    const auto last_scatter_index = truncated_representation_type::from_integral(number_of_particles);
-    particle_scatter_indices_.push_back(last_scatter_index);
-  }
+        temp_particles_(),
+        temp_particle_indices_(),
+        particle_weights_(),
+        particle_scatter_indices_(),
+        buffers_ready_{false} {}
 };
 
 }  // namespace pf::filter
