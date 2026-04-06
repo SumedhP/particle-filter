@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <concepts>
 
 namespace pf::filter::concepts {
@@ -10,7 +11,6 @@ concept prediction = requires(const T p, const float t) {
   { p.extrapolate_state(t) } -> std::same_as<T>;
 
   typename T::soa_storage;
-  { T::soa_storage(std::size_t{}) };
-};
+} && std::constructible_from<typename T::soa_storage, std::size_t>;
 
 }  // namespace pf::filter::concepts

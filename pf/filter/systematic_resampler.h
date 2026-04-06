@@ -91,13 +91,14 @@ template <typename T, typename I>
 class systematic_resampler {
   using weight_type = float;
   using particle_type = T;
+  using particle_storage_type = typename particle_type::soa_storage;
 
   using index_type = I;
   using truncated_representation_type = truncated_representation<I>;
 
  private:
   std::size_t number_of_particles_;
-  target_config::vector<particle_type> temp_particles_;
+  particle_storage_type temp_particles_;
   target_config::vector<index_type> temp_particle_indices_;
 
   target_config::vector<weight_type> particle_weights_;
@@ -108,7 +109,7 @@ class systematic_resampler {
   void resample(
       const ExecutionPolicy& execution_policy,
       const target_config::vector<weight_type>& log_weights,
-      target_config::vector<T>& particles) noexcept {
+      particle_storage_type& particles) noexcept {
     const weight_type maximum_log_weight = thrust::reduce(
         execution_policy,
         log_weights.cbegin(),
@@ -158,12 +159,11 @@ class systematic_resampler {
         temp_particle_indices_.begin(),
         thrust::maximum<index_type>());
 
-    thrust::gather(
-        execution_policy,
-        temp_particle_indices_.cbegin(),
-        temp_particle_indices_.cend(),
-        particles.cbegin(),
-        temp_particles_.begin());
+    particles.gather_into(
+      execution_policy,
+      temp_particle_indices_.cbegin(),
+      temp_particle_indices_.cend(),
+      temp_particles_);
 
     temp_particles_.swap(particles);
   }

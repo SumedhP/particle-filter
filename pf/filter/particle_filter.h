@@ -33,15 +33,35 @@ inline caching_allocator_type thread_local_caching_allocator() {
 
 }  // namespace helper
 
+// ---------------------------------------------------------------------------
+// particle_filter
+//
+// Stores particle state in SOA layout via prediction_type::soa_storage.
+// Each update kernel zips over the per-field vectors, reconstructs a local
+// prediction_type value, calls the configuration method, then scatters the
+// fields back out — giving fully coalesced device memory access.
+//
+// The reduction in reduce_most_likely_() is now fully generic over whatever
+// accumulator type the reduction operator declares as its `state_type`.
+// Configurations using the legacy particle_reduction_state<T> are unaffected;
+// configurations using a scalar SOA accumulator (e.g. scalar_reduction_state)
+// never materialise a full prediction object during the tree reduction.
+// ---------------------------------------------------------------------------
 template <typename ParticleFilterConfiguration>
   requires concepts::particle_filter_configuration<ParticleFilterConfiguration>
 class particle_filter {
  private:
   using particle_configuration_type = ParticleFilterConfiguration;
 
-  using observation_type = typename ParticleFilterConfiguration::observation_type;
-  using prediction_type = typename ParticleFilterConfiguration::prediction_type;
-  using sampler_type = typename ParticleFilterConfiguration::sampler_type;
+  using observation_type    = typename ParticleFilterConfiguration::observation_type;
+  using prediction_type     = typename ParticleFilterConfiguration::prediction_type;
+  using sampler_type        = typename ParticleFilterConfiguration::sampler_type;
+  using soa_storage_type    = typename prediction_type::soa_storage;
+
+  // Derive the reduction accumulator type from the operator the config provides.
+  // This is the key generalisation: no hardcoded particle_reduction_state<T>.
+  using reduction_op_type    = decltype(std::declval<ParticleFilterConfiguration>().most_likely_particle_reduction());
+  using reduction_state_type = typename reduction_op_type::state_type;
 
   helper::caching_allocator_type caching_allocator_;
   ParticleFilterConfiguration config_;
@@ -50,8 +70,8 @@ class particle_filter {
   systematic_resampler<prediction_type, std::uint32_t> resampler_;
 
   target_config::vector<sampler_type> sampler_states_;
-  target_config::vector<float> log_particle_weights_;
-  target_config::vector<prediction_type> particle_states_;
+  target_config::vector<float>        log_particle_weights_;
+  soa_storage_type                    particle_states_;   // SOA
 
  public:
   [[nodiscard]] prediction_type extrapolate_state(const float& time_offset_seconds) const noexcept {
@@ -61,48 +81,71 @@ class particle_filter {
   void update_state_sans_observation(const float& time_offset_seconds) noexcept {
     thrust::for_each(
         target_config::policy(caching_allocator_),
-        thrust::make_zip_iterator(sampler_states_.begin(), particle_states_.begin()),
-        thrust::make_zip_iterator(sampler_states_.end(), particle_states_.end()),
-        [config = config_, time_offset_seconds] PF_TARGET_ONLY_ATTRS(cuda::std::tuple<sampler_type&, prediction_type&> tuple) {
+        thrust::make_zip_iterator(sampler_states_.begin(), particle_states_.zip_begin()),
+        thrust::make_zip_iterator(sampler_states_.end(),   particle_states_.zip_end()),
+        [config = config_, time_offset_seconds]
+        PF_TARGET_ONLY_ATTRS(auto tuple) {
           sampler_type& sampler_state = cuda::std::get<0>(tuple);
-          prediction_type& particle_state = cuda::std::get<1>(tuple);
+          auto& field_tuple           = cuda::std::get<1>(tuple);
+
+          prediction_type particle_state = prediction_type::from_soa_tuple(field_tuple);
           config.apply_process(time_offset_seconds, sampler_state, particle_state);
+          prediction_type::to_soa_tuple(field_tuple, particle_state);
         });
 
-    most_likely_particle_state_ = thrust::transform_reduce(
-                                      target_config::policy(caching_allocator_),
-                                      particle_states_.cbegin(),
-                                      particle_states_.cend(),
-                                      particle_reduction_state_transform<prediction_type>(),
-                                      particle_reduction_state<prediction_type>::zero(),
-                                      config_.most_likely_particle_reduction())
-                                      .most_likely_particle();
+    most_likely_particle_state_ = reduce_most_likely_();
   }
 
   void update_state_with_observation(const float& time_offset_seconds, const observation_type& observation_state) noexcept {
     thrust::for_each(
         target_config::policy(caching_allocator_),
-        thrust::make_zip_iterator(sampler_states_.begin(), log_particle_weights_.begin(), particle_states_.begin()),
-        thrust::make_zip_iterator(sampler_states_.end(), log_particle_weights_.end(), particle_states_.end()),
-        [config = config_, time_offset_seconds, observation_state] PF_TARGET_ONLY_ATTRS(
-            cuda::std::tuple<sampler_type&, float&, prediction_type&> tuple) {
-          sampler_type& sampler_state = cuda::std::get<0>(tuple);
-          float& particle_weight = cuda::std::get<1>(tuple);
-          prediction_type& particle_state = cuda::std::get<2>(tuple);
+        thrust::make_zip_iterator(sampler_states_.begin(), log_particle_weights_.begin(), particle_states_.zip_begin()),
+        thrust::make_zip_iterator(sampler_states_.end(),   log_particle_weights_.end(),   particle_states_.zip_end()),
+        [config = config_, time_offset_seconds, observation_state]
+        PF_TARGET_ONLY_ATTRS(auto tuple) {
+          sampler_type& sampler_state   = cuda::std::get<0>(tuple);
+          float&        particle_weight = cuda::std::get<1>(tuple);
+          auto&         field_tuple     = cuda::std::get<2>(tuple);
 
+          prediction_type particle_state = prediction_type::from_soa_tuple(field_tuple);
           config.apply_process(time_offset_seconds, sampler_state, particle_state);
           particle_weight = config.conditional_log_likelihood(sampler_state, observation_state, particle_state);
+          prediction_type::to_soa_tuple(field_tuple, particle_state);
         });
 
     resampler_.resample(target_config::policy(caching_allocator_), log_particle_weights_, particle_states_);
-    most_likely_particle_state_ = thrust::transform_reduce(
-                                      target_config::policy(caching_allocator_),
-                                      particle_states_.cbegin(),
-                                      particle_states_.cend(),
-                                      particle_reduction_state_transform<prediction_type>(),
-                                      particle_reduction_state<prediction_type>::zero(),
-                                      config_.most_likely_particle_reduction())
-                                      .most_likely_particle();
+    most_likely_particle_state_ = reduce_most_likely_();
+  }
+
+ public:
+  // -------------------------------------------------------------------------
+  // reduce_most_likely_
+  //
+  // Generic over the reduction operator's state_type.
+  //
+  // The transform step calls `reduction_state_type::from_particle(p)` on each
+  // SOA element — for scalar reductions this seeds a plain float struct without
+  // ever constructing an intermediate prediction on the hot path.  For legacy
+  // configs using particle_reduction_state<T>, from_particle() is the existing
+  // from_one_particle() alias, so behaviour is identical to before.
+  //
+  // most_likely_particle() is called exactly once on the final accumulated
+  // state, reconstructing a prediction object only at that point.
+  // -------------------------------------------------------------------------
+  [[nodiscard]] prediction_type reduce_most_likely_() noexcept {
+    const auto reduction_op = config_.most_likely_particle_reduction();
+
+    return thrust::transform_reduce(
+               target_config::policy(caching_allocator_),
+               particle_states_.zip_cbegin(),
+               particle_states_.zip_cend(),
+               [] PF_TARGET_ONLY_ATTRS(const auto& field_tuple) -> reduction_state_type {
+                 return reduction_state_type::from_particle(
+                     prediction_type::from_soa_tuple(field_tuple));
+               },
+               reduction_state_type::zero(),
+               reduction_op)
+        .most_likely_particle();
   }
 
   void initialize_internal_state_(const std::size_t& number_of_particles, const observation_type& initial_observation) noexcept {
@@ -118,25 +161,21 @@ class particle_filter {
           cuda::std::get<1>(tuple).seed(generator());
         });
 
-    thrust::transform(
+    thrust::for_each(
         target_config::policy(caching_allocator_),
-        sampler_states_.begin(),
-        sampler_states_.end(),
-        particle_states_.begin(),
-        [config = config_, initial_observation] PF_TARGET_ONLY_ATTRS(sampler_type & sampler_state) {
-          return config.sample_from(sampler_state, initial_observation);
+        thrust::make_zip_iterator(sampler_states_.begin(), particle_states_.zip_begin()),
+        thrust::make_zip_iterator(sampler_states_.end(),   particle_states_.zip_end()),
+        [config = config_, initial_observation]
+        PF_TARGET_ONLY_ATTRS(auto tuple) {
+          sampler_type& sampler_state = cuda::std::get<0>(tuple);
+          auto&         field_tuple   = cuda::std::get<1>(tuple);
+          prediction_type::to_soa_tuple(field_tuple, config.sample_from(sampler_state, initial_observation));
         });
 
-    most_likely_particle_state_ = thrust::transform_reduce(
-                                      target_config::policy(caching_allocator_),
-                                      particle_states_.cbegin(),
-                                      particle_states_.cend(),
-                                      particle_reduction_state_transform<prediction_type>(),
-                                      particle_reduction_state<prediction_type>::zero(),
-                                      config_.most_likely_particle_reduction())
-                                      .most_likely_particle();
+    most_likely_particle_state_ = reduce_most_likely_();
   }
 
+ public:
   template <typename... Ts>
   particle_filter(const std::size_t& number_of_particles, const observation_type& initial_observation, Ts&&... params) noexcept
       : caching_allocator_{helper::thread_local_caching_allocator()},
