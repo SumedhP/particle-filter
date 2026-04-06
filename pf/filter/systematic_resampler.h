@@ -1,6 +1,8 @@
 #pragma once
 
 #include <pf/config/target_config.h>
+#include <thrust/copy.h>
+#include <thrust/for_each.h>
 #include <thrust/gather.h>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/transform_iterator.h>
@@ -8,8 +10,10 @@
 #include <thrust/reduce.h>
 #include <thrust/scan.h>
 #include <thrust/scatter.h>
+#include <thrust/transform_reduce.h>
 #include <thrust/transform_scan.h>
 
+#include <cmath>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -86,6 +90,49 @@ struct increasing_integral_component_predicate {
   }
 };
 
+struct normalized_log_weight_sum_state {
+  float maximum_log_weight_;
+  float scaled_sum_;
+
+  PF_TARGET_ATTRS [[nodiscard]] static normalized_log_weight_sum_state from_log_weight(const float& log_weight) noexcept {
+    return normalized_log_weight_sum_state{log_weight, 1.0f};
+  }
+
+  PF_TARGET_ATTRS [[nodiscard]] static normalized_log_weight_sum_state zero() noexcept {
+    return normalized_log_weight_sum_state{-std::numeric_limits<float>::infinity(), 0.0f};
+  }
+};
+
+struct normalized_log_weight_sum_reduce {
+  PF_TARGET_ATTRS [[nodiscard]] normalized_log_weight_sum_state operator()(
+      const normalized_log_weight_sum_state& a,
+      const normalized_log_weight_sum_state& b) const noexcept {
+    const float maximum_log_weight = thrust::max(a.maximum_log_weight_, b.maximum_log_weight_);
+
+    const float scaled_sum_a = a.scaled_sum_ * expf(a.maximum_log_weight_ - maximum_log_weight);
+    const float scaled_sum_b = b.scaled_sum_ * expf(b.maximum_log_weight_ - maximum_log_weight);
+
+    return normalized_log_weight_sum_state{maximum_log_weight, scaled_sum_a + scaled_sum_b};
+  }
+};
+
+template <typename T>
+  requires std::unsigned_integral<T>
+struct scaled_truncated_representation_from_log_weight_transform {
+  float maximum_log_weight_;
+  float index_scale_;
+
+  PF_TARGET_ATTRS [[nodiscard]] inline truncated_representation<T> operator()(const float& log_weight) noexcept {
+    const float normalized_weight = expf(log_weight - maximum_log_weight_);
+    return truncated_representation<T>::from_value(index_scale_ * normalized_weight);
+  }
+
+  constexpr scaled_truncated_representation_from_log_weight_transform(
+      const float& maximum_log_weight,
+      const float& index_scale) noexcept
+      : maximum_log_weight_{maximum_log_weight}, index_scale_{index_scale} {}
+};
+
 template <typename T, typename I>
   requires std::unsigned_integral<I>
 class systematic_resampler {
@@ -100,7 +147,6 @@ class systematic_resampler {
   target_config::vector<particle_type> temp_particles_;
   target_config::vector<index_type> temp_particle_indices_;
 
-  target_config::vector<weight_type> particle_weights_;
   target_config::vector<truncated_representation_type> particle_scatter_indices_;
 
  public:
@@ -109,31 +155,24 @@ class systematic_resampler {
       const ExecutionPolicy& execution_policy,
       const target_config::vector<weight_type>& log_weights,
       target_config::vector<T>& particles) noexcept {
-    const weight_type maximum_log_weight = thrust::reduce(
+    const normalized_log_weight_sum_state normalization_state = thrust::transform_reduce(
         execution_policy,
         log_weights.cbegin(),
         log_weights.cend(),
-        -std::numeric_limits<weight_type>::infinity(),
-        thrust::maximum<weight_type>());
+      [] PF_TARGET_ATTRS(const weight_type& log_weight) {
+        return normalized_log_weight_sum_state::from_log_weight(log_weight);
+      },
+      normalized_log_weight_sum_state::zero(),
+      normalized_log_weight_sum_reduce{});
 
-    thrust::transform(
-        execution_policy,
-        log_weights.cbegin(),
-        log_weights.cend(),
-        particle_weights_.begin(),
-        [maximum_log_weight] PF_TARGET_ATTRS(const weight_type& log_weight) { return expf(log_weight - maximum_log_weight); });
-
-    const weight_type cumulative_particle_weight =
-        thrust::reduce(execution_policy, particle_weights_.cbegin(), particle_weights_.cend());
-
-    const weight_type index_scale = static_cast<weight_type>(number_of_particles_) / cumulative_particle_weight;
+    const weight_type index_scale = static_cast<weight_type>(number_of_particles_) / normalization_state.scaled_sum_;
 
     thrust::transform_exclusive_scan(
         execution_policy,
-        particle_weights_.cbegin(),
-        particle_weights_.cend(),
+      log_weights.cbegin(),
+      log_weights.cend(),
         particle_scatter_indices_.begin(),
-        scaled_truncated_representation_transform<index_type>(index_scale),
+      scaled_truncated_representation_from_log_weight_transform<index_type>(normalization_state.maximum_log_weight_, index_scale),
         truncated_representation_type::zero(),
         truncated_representation_bounded_plus<index_type>(number_of_particles_));
 
@@ -158,21 +197,75 @@ class systematic_resampler {
         temp_particle_indices_.begin(),
         thrust::maximum<index_type>());
 
-    thrust::gather(
+    const auto* source_particles = thrust::raw_pointer_cast(particles.data());
+    auto* destination_particles = thrust::raw_pointer_cast(temp_particles_.data());
+    const auto* particle_indices = thrust::raw_pointer_cast(temp_particle_indices_.data());
+
+    thrust::for_each(
+      execution_policy,
+      thrust::make_counting_iterator<index_type>(index_type{}),
+      thrust::make_counting_iterator<index_type>(static_cast<index_type>(number_of_particles_)),
+      [source_particles, destination_particles, particle_indices] PF_TARGET_ATTRS(const index_type& index) {
+        destination_particles[index] = source_particles[particle_indices[index]];
+      });
+
+    temp_particles_.swap(particles);
+  }
+
+  template <typename ExecutionPolicy>
+  void resample_indices(
+      const ExecutionPolicy& execution_policy,
+      const target_config::vector<weight_type>& log_weights,
+      target_config::vector<index_type>& particle_indices) noexcept {
+    const normalized_log_weight_sum_state normalization_state = thrust::transform_reduce(
+        execution_policy,
+        log_weights.cbegin(),
+        log_weights.cend(),
+      [] PF_TARGET_ATTRS(const weight_type& log_weight) {
+        return normalized_log_weight_sum_state::from_log_weight(log_weight);
+      },
+      normalized_log_weight_sum_state::zero(),
+      normalized_log_weight_sum_reduce{});
+
+    const weight_type index_scale = static_cast<weight_type>(number_of_particles_) / normalization_state.scaled_sum_;
+
+    thrust::transform_exclusive_scan(
+        execution_policy,
+        log_weights.cbegin(),
+        log_weights.cend(),
+        particle_scatter_indices_.begin(),
+        scaled_truncated_representation_from_log_weight_transform<index_type>(normalization_state.maximum_log_weight_, index_scale),
+        truncated_representation_type::zero(),
+        truncated_representation_bounded_plus<index_type>(number_of_particles_));
+
+    thrust::fill(execution_policy, temp_particle_indices_.begin(), temp_particle_indices_.end(), index_type{});
+    const auto input_index_iterator = thrust::make_counting_iterator<index_type>(index_type{});
+
+    thrust::scatter_if(
+        execution_policy,
+        input_index_iterator,
+        input_index_iterator + number_of_particles_,
+        thrust::make_transform_iterator(
+            particle_scatter_indices_.cbegin(),
+            [] PF_TARGET_ATTRS(const truncated_representation_type& index) { return index.integral_component(); }),
+        thrust::make_zip_iterator(particle_scatter_indices_.cbegin(), std::next(particle_scatter_indices_.cbegin())),
+        temp_particle_indices_.begin(),
+        increasing_integral_component_predicate{});
+
+    thrust::inclusive_scan(
         execution_policy,
         temp_particle_indices_.cbegin(),
         temp_particle_indices_.cend(),
-        particles.cbegin(),
-        temp_particles_.begin());
+        temp_particle_indices_.begin(),
+        thrust::maximum<index_type>());
 
-    temp_particles_.swap(particles);
+    temp_particle_indices_.swap(particle_indices);
   }
 
   systematic_resampler(const std::size_t& number_of_particles) noexcept
       : number_of_particles_{number_of_particles},
         temp_particles_(number_of_particles),
         temp_particle_indices_(number_of_particles),
-        particle_weights_(number_of_particles),
         particle_scatter_indices_(number_of_particles) {
     const auto last_scatter_index = truncated_representation_type::from_integral(number_of_particles);
     particle_scatter_indices_.push_back(last_scatter_index);
