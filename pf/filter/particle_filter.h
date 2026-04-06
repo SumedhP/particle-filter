@@ -33,20 +33,6 @@ inline caching_allocator_type thread_local_caching_allocator() {
 
 }  // namespace helper
 
-// ---------------------------------------------------------------------------
-// particle_filter
-//
-// Stores particle state in SOA layout via prediction_type::soa_storage.
-// Each update kernel zips over the per-field vectors, reconstructs a local
-// prediction_type value, calls the configuration method, then scatters the
-// fields back out — giving fully coalesced device memory access.
-//
-// The reduction in reduce_most_likely_() is now fully generic over whatever
-// accumulator type the reduction operator declares as its `state_type`.
-// Configurations using the legacy particle_reduction_state<T> are unaffected;
-// configurations using a scalar SOA accumulator (e.g. scalar_reduction_state)
-// never materialise a full prediction object during the tree reduction.
-// ---------------------------------------------------------------------------
 template <typename ParticleFilterConfiguration>
   requires concepts::particle_filter_configuration<ParticleFilterConfiguration>
 class particle_filter {
@@ -58,8 +44,6 @@ class particle_filter {
   using sampler_type        = typename ParticleFilterConfiguration::sampler_type;
   using soa_storage_type    = typename prediction_type::soa_storage;
 
-  // Derive the reduction accumulator type from the operator the config provides.
-  // This is the key generalisation: no hardcoded particle_reduction_state<T>.
   using reduction_op_type    = decltype(std::declval<ParticleFilterConfiguration>().most_likely_particle_reduction());
   using reduction_state_type = typename reduction_op_type::state_type;
 
@@ -70,8 +54,8 @@ class particle_filter {
   systematic_resampler<prediction_type, std::uint32_t> resampler_;
 
   target_config::vector<sampler_type> sampler_states_;
-  target_config::vector<float>        log_particle_weights_;
-  soa_storage_type                    particle_states_;   // SOA
+  target_config::vector<float> log_particle_weights_;
+  soa_storage_type particle_states_;
 
  public:
   [[nodiscard]] prediction_type extrapolate_state(const float& time_offset_seconds) const noexcept {
@@ -124,20 +108,6 @@ class particle_filter {
   }
 
  public:
-  // -------------------------------------------------------------------------
-  // reduce_most_likely_
-  //
-  // Generic over the reduction operator's state_type.
-  //
-  // The transform step calls `reduction_state_type::from_particle(p)` on each
-  // SOA element — for scalar reductions this seeds a plain float struct without
-  // ever constructing an intermediate prediction on the hot path.  For legacy
-  // configs using particle_reduction_state<T>, from_particle() is the existing
-  // from_one_particle() alias, so behaviour is identical to before.
-  //
-  // most_likely_particle() is called exactly once on the final accumulated
-  // state, reconstructing a prediction object only at that point.
-  // -------------------------------------------------------------------------
   [[nodiscard]] prediction_type reduce_most_likely_() noexcept {
     const auto reduction_op = config_.most_likely_particle_reduction();
 
