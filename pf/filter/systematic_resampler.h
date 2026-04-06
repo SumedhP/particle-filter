@@ -1,8 +1,10 @@
 #pragma once
 
 #include <pf/config/target_config.h>
+#include <thrust/copy.h>
 #include <thrust/gather.h>
 #include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/permutation_iterator.h>
 #include <thrust/iterator/transform_iterator.h>
 #include <thrust/iterator/zip_iterator.h>
 #include <thrust/reduce.h>
@@ -159,11 +161,11 @@ class systematic_resampler {
         temp_particle_indices_.begin(),
         thrust::maximum<index_type>());
 
-    particles.gather_into(
-      execution_policy,
-      temp_particle_indices_.cbegin(),
-      temp_particle_indices_.cend(),
-      temp_particles_);
+    thrust::copy(
+        execution_policy,
+        thrust::make_permutation_iterator(particles.zip_cbegin(), temp_particle_indices_.cbegin()),
+        thrust::make_permutation_iterator(particles.zip_cbegin(), temp_particle_indices_.cend()),
+        temp_particles_.zip_begin());
 
     temp_particles_.swap(particles);
   }
