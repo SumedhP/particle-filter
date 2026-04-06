@@ -117,6 +117,12 @@ class particle_filter {
     most_likely_particle_state_ = reduce_most_likely_();
   }
 
+  // Reinitialize around a new observation without reallocating or reseeding
+  // sampler states; this reuses existing buffers and RNG progression.
+  void reinitialize(const observation_type& initial_observation) noexcept {
+    initialize_particle_states_(initial_observation);
+  }
+
  public:
   // -------------------------------------------------------------------------
   // reduce_most_likely_
@@ -148,7 +154,7 @@ class particle_filter {
         .most_likely_particle();
   }
 
-  void initialize_internal_state_(const std::size_t& number_of_particles, const observation_type& initial_observation) noexcept {
+  void initialize_sampler_states_(const std::size_t& number_of_particles) noexcept {
     thrust::counting_iterator<std::size_t> index_sequence_begin(std::size_t{});
 
     thrust::for_each(
@@ -160,7 +166,9 @@ class particle_filter {
           generator.discard(cuda::std::get<0>(tuple));
           cuda::std::get<1>(tuple).seed(generator());
         });
+  }
 
+  void initialize_particle_states_(const observation_type& initial_observation) noexcept {
     thrust::for_each(
         target_config::policy(caching_allocator_),
         thrust::make_zip_iterator(sampler_states_.begin(), particle_states_.zip_begin()),
@@ -173,6 +181,11 @@ class particle_filter {
         });
 
     most_likely_particle_state_ = reduce_most_likely_();
+  }
+
+  void initialize_internal_state_(const std::size_t& number_of_particles, const observation_type& initial_observation) noexcept {
+    initialize_sampler_states_(number_of_particles);
+    initialize_particle_states_(initial_observation);
   }
 
  public:
