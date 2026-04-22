@@ -1,6 +1,7 @@
 #pragma once
 
 #include <pf/config/target_config.h>
+#include <pf/filter/concepts/initialization_prior.h>
 #include <pf/filter/concepts/particle_filter_configuration.h>
 #include <pf/filter/particle_reduction_state.h>
 #include <pf/filter/systematic_resampler.h>
@@ -46,6 +47,14 @@ class particle_filter {
 
   using reduction_op_type    = decltype(std::declval<ParticleFilterConfiguration>().most_likely_particle_reduction());
   using reduction_state_type = typename reduction_op_type::state_type;
+
+  using initialization_prior_type = concepts::initialization_prior_type_t<ParticleFilterConfiguration>;
+
+  static constexpr bool supports_initialization_prior_v =
+      concepts::initialization_prior_compatible<ParticleFilterConfiguration>;
+
+  using initialization_prior_param_type =
+      std::conditional_t<supports_initialization_prior_v, initialization_prior_type, observation_type>;
 
   helper::caching_allocator_type caching_allocator_;
   ParticleFilterConfiguration config_;
@@ -107,6 +116,11 @@ class particle_filter {
     initialize_particle_states_(initial_observation);
   }
 
+  void reinitialize(const observation_type& initial_observation, const initialization_prior_param_type& initialization_prior) noexcept
+    requires supports_initialization_prior_v {
+    initialize_particle_states_(initial_observation, initialization_prior);
+  }
+
  public:
   [[nodiscard]] prediction_type reduce_most_likely_() noexcept {
     const auto reduction_op = config_.most_likely_particle_reduction();
@@ -153,9 +167,38 @@ class particle_filter {
     most_likely_particle_state_ = reduce_most_likely_();
   }
 
+  void initialize_particle_states_(
+      const observation_type& initial_observation,
+      const initialization_prior_param_type& initialization_prior) noexcept
+    requires supports_initialization_prior_v {
+    thrust::for_each(
+        target_config::policy(caching_allocator_),
+        thrust::make_zip_iterator(sampler_states_.begin(), particle_states_.zip_begin()),
+        thrust::make_zip_iterator(sampler_states_.end(),   particle_states_.zip_end()),
+        [config = config_, initial_observation, initialization_prior]
+        PF_TARGET_ONLY_ATTRS(auto tuple) {
+          sampler_type& sampler_state = cuda::std::get<0>(tuple);
+          auto&         field_tuple   = cuda::std::get<1>(tuple);
+          prediction_type::to_soa_tuple(
+              field_tuple,
+              config.sample_from(sampler_state, initial_observation, initialization_prior));
+        });
+
+    most_likely_particle_state_ = reduce_most_likely_();
+  }
+
   void initialize_internal_state_(const std::size_t& number_of_particles, const observation_type& initial_observation) noexcept {
     initialize_sampler_states_(number_of_particles);
     initialize_particle_states_(initial_observation);
+  }
+
+  void initialize_internal_state_(
+      const std::size_t& number_of_particles,
+      const observation_type& initial_observation,
+      const initialization_prior_param_type& initialization_prior) noexcept
+    requires supports_initialization_prior_v {
+    initialize_sampler_states_(number_of_particles);
+    initialize_particle_states_(initial_observation, initialization_prior);
   }
 
  public:
@@ -168,6 +211,22 @@ class particle_filter {
         log_particle_weights_(number_of_particles),
         particle_states_(number_of_particles) {
     initialize_internal_state_(number_of_particles, initial_observation);
+  }
+
+  template <typename... Ts>
+  particle_filter(
+      const std::size_t& number_of_particles,
+      const observation_type& initial_observation,
+      const initialization_prior_param_type& initialization_prior,
+      Ts&&... params) noexcept
+      requires supports_initialization_prior_v
+      : caching_allocator_{helper::thread_local_caching_allocator()},
+        config_(std::forward<Ts>(params)...),
+        resampler_(number_of_particles),
+        sampler_states_(number_of_particles),
+        log_particle_weights_(number_of_particles),
+        particle_states_(number_of_particles) {
+    initialize_internal_state_(number_of_particles, initial_observation, initialization_prior);
   }
 };
 
