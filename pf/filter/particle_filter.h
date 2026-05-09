@@ -105,6 +105,25 @@ class particle_filter {
                                       .most_likely_particle();
   }
 
+  void reinitialize(const observation_type& new_observation) noexcept {
+    thrust::transform(
+        target_config::policy(caching_allocator_),
+        sampler_states_.begin(),
+        sampler_states_.end(),
+        particle_states_.begin(),
+        [config = config_, new_observation] PF_TARGET_ONLY_ATTRS(sampler_type& sampler_state) {
+          return config.sample_from(sampler_state, new_observation);
+        });
+    most_likely_particle_state_ = thrust::transform_reduce(
+                                      target_config::policy(caching_allocator_),
+                                      particle_states_.cbegin(),
+                                      particle_states_.cend(),
+                                      particle_reduction_state_transform<prediction_type>(),
+                                      particle_reduction_state<prediction_type>::zero(),
+                                      config_.most_likely_particle_reduction())
+                                      .most_likely_particle();
+  }
+
   void initialize_internal_state_(const std::size_t& number_of_particles, const observation_type& initial_observation) noexcept {
     thrust::counting_iterator<std::size_t> index_sequence_begin(std::size_t{});
 
