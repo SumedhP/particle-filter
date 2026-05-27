@@ -1,11 +1,13 @@
 #pragma once
 
 #include <pf/filter/concepts/observation.h>
+#include <pf/filter/concepts/initialization_prior.h>
 #include <pf/filter/concepts/particle_reduction_operation.h>
 #include <pf/filter/concepts/prediction.h>
 #include <pf/filter/concepts/sampler.h>
 
 #include <concepts>
+#include <optional>
 
 namespace pf::filter::concepts {
 
@@ -19,9 +21,11 @@ concept particle_filter_configuration = requires(
   requires sampler<typename T::sampler_type>;
   requires observation<typename T::observation_type>;
   requires prediction<typename T::prediction_type>;
+  requires initialization_prior<typename T::initialization_prior_type>;
 
   { c.apply_process(t, s, p) } -> std::same_as<void>;
   { c.sample_from(s, o) } -> std::same_as<typename T::prediction_type>;
+  { c.sample_from(s, o, std::optional<typename T::initialization_prior_type>{}) } -> std::same_as<typename T::prediction_type>;
   { c.conditional_log_likelihood(std::as_const(s), o, p) } -> std::same_as<float>;
   { c.most_likely_particle_reduction() } -> particle_reduction_operation<typename T::prediction_type>;
 };

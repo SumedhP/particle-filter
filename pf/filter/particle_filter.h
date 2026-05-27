@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cuda/std/tuple>
+#include <optional>
 #include <utility>
 
 namespace pf::filter {
@@ -42,6 +43,7 @@ class particle_filter {
   using observation_type    = typename ParticleFilterConfiguration::observation_type;
   using prediction_type     = typename ParticleFilterConfiguration::prediction_type;
   using sampler_type        = typename ParticleFilterConfiguration::sampler_type;
+  using initialization_prior_type = typename ParticleFilterConfiguration::initialization_prior_type;
   using soa_storage_type    = typename prediction_type::soa_storage;
 
   using reduction_op_type    = decltype(std::declval<ParticleFilterConfiguration>().most_likely_particle_reduction());
@@ -104,7 +106,13 @@ class particle_filter {
   // Reinitialize around a new observation without reallocating or reseeding
   // sampler states; this reuses existing buffers and RNG progression.
   void reinitialize(const observation_type& initial_observation) noexcept {
-    initialize_particle_states_(initial_observation);
+    initialize_particle_states_(initial_observation, std::nullopt);
+  }
+
+  void reinitialize(
+      const observation_type& initial_observation,
+      const initialization_prior_type& initialization_prior) noexcept {
+    initialize_particle_states_(initial_observation, initialization_prior);
   }
 
  public:
@@ -138,16 +146,20 @@ class particle_filter {
         });
   }
 
-  void initialize_particle_states_(const observation_type& initial_observation) noexcept {
+  void initialize_particle_states_(
+      const observation_type& initial_observation,
+      const std::optional<initialization_prior_type>& initialization_prior) noexcept {
     thrust::for_each(
         target_config::policy(caching_allocator_),
         thrust::make_zip_iterator(sampler_states_.begin(), particle_states_.zip_begin()),
         thrust::make_zip_iterator(sampler_states_.end(),   particle_states_.zip_end()),
-        [config = config_, initial_observation]
+        [config = config_, initial_observation, initialization_prior]
         PF_TARGET_ONLY_ATTRS(auto tuple) {
           sampler_type& sampler_state = cuda::std::get<0>(tuple);
           auto&         field_tuple   = cuda::std::get<1>(tuple);
-          prediction_type::to_soa_tuple(field_tuple, config.sample_from(sampler_state, initial_observation));
+          prediction_type::to_soa_tuple(
+              field_tuple,
+              config.sample_from(sampler_state, initial_observation, initialization_prior));
         });
 
     most_likely_particle_state_ = reduce_most_likely_();
@@ -155,7 +167,7 @@ class particle_filter {
 
   void initialize_internal_state_(const std::size_t& number_of_particles, const observation_type& initial_observation) noexcept {
     initialize_sampler_states_(number_of_particles);
-    initialize_particle_states_(initial_observation);
+    initialize_particle_states_(initial_observation, std::nullopt);
   }
 
  public:

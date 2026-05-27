@@ -9,6 +9,7 @@
 #include <thrust/random.h>
 
 #include <Eigen/Dense>
+#include <optional>
 
 namespace point {
 
@@ -40,6 +41,9 @@ class particle_filter_configuration {
   using prediction_type = prediction;
 
   using sampler_type = sampler;
+  struct initialization_prior_type {
+    float robot_radius;
+  };
 
   [[nodiscard]] most_likely_particle_reduction_impl most_likely_particle_reduction() const noexcept {
     return most_likely_particle_reduction_impl{};
@@ -52,6 +56,14 @@ class particle_filter_configuration {
   }
 
   PF_TARGET_ATTRS prediction sample_from(sampler& sampler, const observation& state) const noexcept {
+    return sample_from(sampler, state, std::nullopt);
+  }
+
+  PF_TARGET_ATTRS prediction sample_from(
+      sampler& sampler,
+      const observation& state,
+      const std::optional<initialization_prior_type>& initialization_prior) const noexcept {
+    (void)initialization_prior;
     const auto position_noise = sampler.normal_sample(state.position_diagonal_covariance());
     const auto velocity_noise = sampler.normal_sample(velocity_prior_diagonal_covariance_);
     return prediction(state.position() + position_noise, velocity_noise);
