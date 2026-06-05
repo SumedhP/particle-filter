@@ -120,15 +120,16 @@ class particle_filter {
     const auto reduction_op = config_.most_likely_particle_reduction();
 
     return thrust::transform_reduce(
-               target_config::policy(caching_allocator_),
-               particle_states_.zip_cbegin(),
-               particle_states_.zip_cend(),
-               [] PF_TARGET_ONLY_ATTRS(const auto& field_tuple) -> reduction_state_type {
-                 return reduction_state_type::from_particle(
-                     prediction_type::from_soa_tuple(field_tuple));
-               },
-               reduction_state_type::zero(),
-               reduction_op)
+              target_config::policy(caching_allocator_),
+              particle_states_.zip_cbegin(),
+              particle_states_.zip_cend(),
+              cuda::proclaim_return_type<reduction_state_type>(
+                  [] PF_TARGET_ONLY_ATTRS(const auto& field_tuple) -> reduction_state_type {
+                    return reduction_state_type::from_particle(
+                        prediction_type::from_soa_tuple(field_tuple));
+                  }),
+              reduction_state_type::zero(),
+              reduction_op)
         .most_likely_particle();
   }
 

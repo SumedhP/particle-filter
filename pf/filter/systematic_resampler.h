@@ -11,6 +11,7 @@
 #include <thrust/scan.h>
 #include <thrust/scatter.h>
 #include <thrust/transform_scan.h>
+#include <thrust/extrema.h>
 
 #include <concepts>
 #include <cstddef>
